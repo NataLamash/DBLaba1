@@ -3,12 +3,13 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <unordered_map>
 
 struct User {
     int userID;
     char name[30];
     char email[50];
-    int firstReviewIndex;
+    int firstReviewIndex; // індекс першого відгуку у слейв файлі
     int reviewCount;
     bool isDeleted;
 };
@@ -17,7 +18,7 @@ struct Review {
     int reviewID;
     int userID;
     char content[100];
-    int nextReviewIndex;
+    int nextReviewIndex; // індекс наступного відгуку у ланцюжку
     bool isDeleted;
 };
 
@@ -26,9 +27,10 @@ struct UserIndex {
     int recordIndex;
 };
 
-std::vector<int> userTrash; // Сміттєва зона для видалених записів користувачів
+std::vector<int> userTrash;   // Сміттєва зона для видалених записів користувачів
 std::vector<int> reviewTrash; // Сміттєва зона для видалених записів відгуків
 
+// Функції створення початкових файлів
 void createMaster() {
     std::ofstream masterFile("users.fl", std::ios::binary | std::ios::trunc);
     std::ofstream indexFile("users.ind", std::ios::binary | std::ios::trunc);
@@ -65,26 +67,42 @@ void createSlave() {
     slaveFile.close();
 }
 
+// Функція для доступу до користувача через майстер-файл з використанням бінарного пошуку по відсортованій індексній таблиці
 void getMaster(int userID) {
     std::ifstream indexFile("users.ind", std::ios::binary);
+    std::vector<UserIndex> indexTable;
     UserIndex index;
     while (indexFile.read(reinterpret_cast<char*>(&index), sizeof(UserIndex))) {
-        if (index.userID == userID) {
-            std::ifstream masterFile("users.fl", std::ios::binary);
-            masterFile.seekg(index.recordIndex * sizeof(User));
-            User user;
-            masterFile.read(reinterpret_cast<char*>(&user), sizeof(User));
-            if (!user.isDeleted) {
-                std::cout << "UserID: " << user.userID << "\nName: " << user.name << "\nEmail: " << user.email << "\nReviewCount: " << user.reviewCount << std::endl;
-            } else {
-                std::cout << "Record is deleted." << std::endl;
-            }
-            masterFile.close();
-            return;
-        }
+        indexTable.push_back(index);
     }
-    std::cout << "User not found." << std::endl;
     indexFile.close();
+
+    // Сортування за userID
+    std::sort(indexTable.begin(), indexTable.end(), [](const UserIndex& a, const UserIndex& b) {
+        return a.userID < b.userID;
+    });
+
+    // Бінарний пошук
+    auto it = std::lower_bound(indexTable.begin(), indexTable.end(), userID, [](const UserIndex& idx, int value) {
+        return idx.userID < value;
+    });
+
+    if (it != indexTable.end() && it->userID == userID) {
+        int recordIndex = it->recordIndex;
+        std::ifstream masterFile("users.fl", std::ios::binary);
+        masterFile.seekg(recordIndex * sizeof(User));
+        User user;
+        masterFile.read(reinterpret_cast<char*>(&user), sizeof(User));
+        masterFile.close();
+        if (!user.isDeleted) {
+            std::cout << "UserID: " << user.userID << "\nName: " << user.name
+                      << "\nEmail: " << user.email << "\nReviewCount: " << user.reviewCount << std::endl;
+        } else {
+            std::cout << "Record is deleted." << std::endl;
+        }
+    } else {
+        std::cout << "User not found." << std::endl;
+    }
 }
 
 void getSlave(int userID) {
@@ -115,8 +133,10 @@ void getSlave(int userID) {
     masterFile.close();
 }
 
+// Прототип функції delSlave
+void delSlave(int reviewIndex);
 
-
+// Оновлена функція видалення користувача (майстер) з викликом оновленого видалення відгуків
 void delMaster(int userID) {
     std::fstream masterFile("users.fl", std::ios::binary | std::ios::in | std::ios::out);
     std::ifstream indexFile("users.ind", std::ios::binary);
@@ -141,8 +161,7 @@ void delMaster(int userID) {
     masterFile.seekg(recordIndex * sizeof(User));
     masterFile.read(reinterpret_cast<char*>(&user), sizeof(User));
 
-    void delSlave(int reviewIndex);
-    
+    // Видалення всіх пов’язаних відгуків із оновленням ланцюжка
     int reviewIndex = user.firstReviewIndex;
     while (reviewIndex != -1) {
         std::ifstream reviewFile("reviews.fl", std::ios::binary);
@@ -165,23 +184,91 @@ void delMaster(int userID) {
     userTrash.push_back(recordIndex);
 
     std::ofstream indexFileOut("users.ind", std::ios::binary | std::ios::trunc);
+    
+    // Записуємо лише записи активних користувачів
     for (const auto& idx : indexTable) {
         indexFileOut.write(reinterpret_cast<const char*>(&idx), sizeof(UserIndex));
     }
     indexFileOut.close();
 }
-    
 
+// Оновлена функція видалення відгуку (слейв) з оновленням ланцюжка зв’язування
 void delSlave(int reviewIndex) {
+    // Відкриваємо файл відгуків для позначення видалення
     std::fstream reviewFile("reviews.fl", std::ios::binary | std::ios::in | std::ios::out);
-    Review review;
+    Review reviewToDelete;
     reviewFile.seekg(reviewIndex * sizeof(Review));
-    reviewFile.read(reinterpret_cast<char*>(&review), sizeof(Review));
-    review.isDeleted = true;
+    reviewFile.read(reinterpret_cast<char*>(&reviewToDelete), sizeof(Review));
+    if (reviewToDelete.isDeleted) {
+        reviewFile.close();
+        return;
+    }
+    int userID = reviewToDelete.userID;
+    int nextIndex = reviewToDelete.nextReviewIndex;
+    reviewToDelete.isDeleted = true;
     reviewFile.seekp(reviewIndex * sizeof(Review));
-    reviewFile.write(reinterpret_cast<char*>(&review), sizeof(Review));
+    reviewFile.write(reinterpret_cast<char*>(&reviewToDelete), sizeof(Review));
     reviewFile.close();
 
+    // Оновлюємо зв'язок: спочатку перевіряємо, чи є видаляємий відгук першим у ланцюжку користувача
+    std::fstream masterFile("users.fl", std::ios::binary | std::ios::in | std::ios::out);
+    User user;
+    int userPos = -1;
+    int pos = 0;
+    bool found = false;
+    masterFile.seekg(0, std::ios::beg);
+    while (masterFile.read(reinterpret_cast<char*>(&user), sizeof(User))) {
+        if (user.userID == userID && !user.isDeleted) {
+            userPos = pos;
+            found = true;
+            break;
+        }
+        pos++;
+    }
+    if (found) {
+        if (user.firstReviewIndex == reviewIndex) {
+            user.firstReviewIndex = nextIndex;
+            if(user.reviewCount > 0) user.reviewCount--;
+            masterFile.seekp(userPos * sizeof(User));
+            masterFile.write(reinterpret_cast<char*>(&user), sizeof(User));
+            masterFile.close();
+            reviewTrash.push_back(reviewIndex);
+            return;
+        }
+    }
+    masterFile.close();
+
+    // Якщо відгук не є першим, шукаємо попередній елемент у ланцюжку
+    std::fstream slaveFile("reviews.fl", std::ios::binary | std::ios::in | std::ios::out);
+    // Отримуємо актуальний firstReviewIndex користувача з файлу
+    std::ifstream masterFileIn("users.fl", std::ios::binary);
+    User user2;
+    int userFirstReviewIndex = -1;
+    while (masterFileIn.read(reinterpret_cast<char*>(&user2), sizeof(User))) {
+        if (user2.userID == userID && !user2.isDeleted) {
+            userFirstReviewIndex = user2.firstReviewIndex;
+            break;
+        }
+    }
+    masterFileIn.close();
+    if (userFirstReviewIndex == -1) {
+        slaveFile.close();
+        return;
+    }
+    int currentIndex = userFirstReviewIndex;
+    while (currentIndex != -1) {
+        Review currentReview;
+        slaveFile.seekg(currentIndex * sizeof(Review));
+        slaveFile.read(reinterpret_cast<char*>(&currentReview), sizeof(Review));
+        if (currentReview.nextReviewIndex == reviewIndex) {
+            currentReview.nextReviewIndex = nextIndex;
+            slaveFile.seekp(currentIndex * sizeof(Review));
+            slaveFile.write(reinterpret_cast<char*>(&currentReview), sizeof(Review));
+            break;
+        }
+        currentIndex = currentReview.nextReviewIndex;
+    }
+    slaveFile.close();
     reviewTrash.push_back(reviewIndex);
 }
 
@@ -197,7 +284,6 @@ void insertMaster() {
     user.isDeleted = false;
 
     int recordIndex;
-
     if (!userTrash.empty()) {
         recordIndex = userTrash.back();
         userTrash.pop_back();
@@ -225,6 +311,7 @@ void insertSlave() {
     std::cin.getline(review.content, 100);
     review.isDeleted = false;
 
+    // Знаходимо користувача для вставки відгуку
     std::fstream masterFile("users.fl", std::ios::binary | std::ios::in | std::ios::out);
     int userIndex = -1;
     User user;
@@ -237,10 +324,9 @@ void insertSlave() {
 
     if (userIndex == -1) {
         std::cout << "User not found." << std::endl;
+        masterFile.close();
         return;
     }
-
-    
 
     int reviewIndex;
     if (!reviewTrash.empty()) {
@@ -252,6 +338,7 @@ void insertSlave() {
         reviewIndex = slaveFile.tellp() / sizeof(Review);
     }
 
+    // Новий відгук вставляється на початок ланцюжка
     review.nextReviewIndex = user.firstReviewIndex;
     user.firstReviewIndex = reviewIndex;
     user.reviewCount++;
@@ -264,7 +351,6 @@ void insertSlave() {
     masterFile.close();
 }
 
-
 void updateMaster() {
     int userID;
     std::cout << "Enter userID to update: ";
@@ -273,7 +359,6 @@ void updateMaster() {
     std::ifstream indexFile("users.ind", std::ios::binary);
     UserIndex index;
     int recordIndex = -1;
-
     while (indexFile.read(reinterpret_cast<char*>(&index), sizeof(UserIndex))) {
         if (index.userID == userID) {
             recordIndex = index.recordIndex;
@@ -301,14 +386,13 @@ void updateMaster() {
     std::cout << "Enter field to update (name/email): ";
     std::string field;
     std::cin >> field;
+    std::cin.ignore();
 
     if (field == "name") {
         std::cout << "Enter new name: ";
-        std::cin.ignore();
         std::cin.getline(user.name, 30);
     } else if (field == "email") {
         std::cout << "Enter new email: ";
-        std::cin.ignore();
         std::cin.getline(user.email, 50);
     } else {
         std::cout << "Invalid field." << std::endl;
@@ -342,10 +426,10 @@ void updateSlave() {
     std::cout << "Enter field to update (content): ";
     std::string field;
     std::cin >> field;
+    std::cin.ignore();
 
     if (field == "content") {
         std::cout << "Enter new content: ";
-        std::cin.ignore();
         std::cin.getline(review.content, 100);
     } else {
         std::cout << "Invalid field." << std::endl;
@@ -370,19 +454,14 @@ void calcMaster() {
     int totalCount = 0;
     int activeCount = 0;
     User user;
-
     while (masterFile.read(reinterpret_cast<char*>(&user), sizeof(User))) {
         totalCount++;
-        if (!user.isDeleted) {
+        if (!user.isDeleted)
             activeCount++;
-        }
     }
-
     masterFile.close();
     std::cout << "Total users: " << totalCount << ", Active users: " << activeCount << std::endl;
 }
-
-
 
 void calcSlave() {
     std::ifstream masterFile("users.fl", std::ios::binary);
@@ -395,11 +474,9 @@ void calcSlave() {
     int totalCount = 0;
     int activeCount = 0;
     User user;
-
     while (masterFile.read(reinterpret_cast<char*>(&user), sizeof(User))) {
-        if (user.isDeleted) {
+        if (user.isDeleted)
             continue;
-        }
 
         int userReviewCount = 0;
         int reviewIndex = user.firstReviewIndex;
@@ -414,10 +491,8 @@ void calcSlave() {
             }
             reviewIndex = review.nextReviewIndex;
         }
-
         std::cout << "UserID: " << user.userID << " has " << userReviewCount << " active reviews." << std::endl;
     }
-
     masterFile.close();
     reviewFile.close();
     std::cout << "Total reviews: " << totalCount << ", Active reviews: " << activeCount << std::endl;
@@ -429,16 +504,14 @@ void utMaster() {
         std::cout << "Failed to open users.fl" << std::endl;
         return;
     }
-
     User user;
     int index = 0;
     while (masterFile.read(reinterpret_cast<char*>(&user), sizeof(User))) {
-        std::cout << "Index: " << index << " | UserID: " << user.userID << " | Name: " << user.name << " | Email: " << user.email
-                  << " | FirstReviewIndex: " << user.firstReviewIndex << " | ReviewCount: " << user.reviewCount
-                  << " | isDeleted: " << user.isDeleted << std::endl;
+        std::cout << "Index: " << index << " | UserID: " << user.userID << " | Name: " << user.name
+                  << " | Email: " << user.email << " | FirstReviewIndex: " << user.firstReviewIndex
+                  << " | ReviewCount: " << user.reviewCount << " | isDeleted: " << user.isDeleted << std::endl;
         ++index;
     }
-
     masterFile.close();
 }
 
@@ -448,16 +521,114 @@ void utSlave() {
         std::cout << "Failed to open reviews.fl" << std::endl;
         return;
     }
-
     Review review;
     int index = 0;
     while (slaveFile.read(reinterpret_cast<char*>(&review), sizeof(Review))) {
-        std::cout << "Index: " << index << " | ReviewID: " << review.reviewID << " | UserID: " << review.userID << " | Content: " << review.content
-                  << " | NextReviewIndex: " << review.nextReviewIndex << " | isDeleted: " << review.isDeleted << std::endl;
+        std::cout << "Index: " << index << " | ReviewID: " << review.reviewID << " | UserID: " << review.userID
+                  << " | Content: " << review.content << " | NextReviewIndex: " << review.nextReviewIndex
+                  << " | isDeleted: " << review.isDeleted << std::endl;
         ++index;
     }
-
     slaveFile.close();
+}
+
+// Функції для фізичної реорганізації файлів
+
+// Перебудова майстер-файлу та індексної таблиці
+void reorganizeMaster() {
+    std::ifstream masterIn("users.fl", std::ios::binary);
+    std::vector<User> newUsers;
+    std::vector<UserIndex> newIndex;
+    User user;
+    while (masterIn.read(reinterpret_cast<char*>(&user), sizeof(User))) {
+        if (!user.isDeleted) {
+            newIndex.push_back({user.userID, static_cast<int>(newUsers.size())});
+            newUsers.push_back(user);
+        }
+    }
+    masterIn.close();
+
+    std::ofstream masterOut("users_new.fl", std::ios::binary | std::ios::trunc);
+    for (const auto &u : newUsers) {
+        masterOut.write(reinterpret_cast<const char*>(&u), sizeof(User));
+    }
+    masterOut.close();
+    remove("users.fl");
+    rename("users_new.fl", "users.fl");
+
+    // Сортуруємо індексну таблицю за userID
+    std::sort(newIndex.begin(), newIndex.end(), [](const UserIndex &a, const UserIndex &b) {
+        return a.userID < b.userID;
+    });
+    std::ofstream indexOut("users.ind", std::ios::binary | std::ios::trunc);
+    for (const auto &idx : newIndex) {
+        indexOut.write(reinterpret_cast<const char*>(&idx), sizeof(UserIndex));
+    }
+    indexOut.close();
+}
+
+// Перебудова слейв файлу із корекцією зв’язків
+void reorganizeSlave() {
+    std::ifstream slaveIn("reviews.fl", std::ios::binary);
+    std::vector<Review> newReviews;
+    // Карта: старий індекс -> новий індекс
+    std::unordered_map<int, int> mappingMap;
+    int oldIndex = 0;
+    Review review;
+    while (slaveIn.read(reinterpret_cast<char*>(&review), sizeof(Review))) {
+        if (!review.isDeleted) {
+            int newIndex = newReviews.size();
+            newReviews.push_back(review);
+            mappingMap[oldIndex] = newIndex;
+        }
+        oldIndex++;
+    }
+    slaveIn.close();
+
+    // Оновлюємо посилання у нових записах
+    for (auto &r : newReviews) {
+        if (r.nextReviewIndex != -1) {
+            if (mappingMap.find(r.nextReviewIndex) != mappingMap.end())
+                r.nextReviewIndex = mappingMap[r.nextReviewIndex];
+            else
+                r.nextReviewIndex = -1;
+        }
+    }
+
+    std::ofstream slaveOut("reviews_new.fl", std::ios::binary | std::ios::trunc);
+    for (const auto &r : newReviews) {
+        slaveOut.write(reinterpret_cast<const char*>(&r), sizeof(Review));
+    }
+    slaveOut.close();
+    remove("reviews.fl");
+    rename("reviews_new.fl", "reviews.fl");
+
+    // Оновлюємо посилання в майстер-файлі (firstReviewIndex)
+    std::fstream masterFile("users.fl", std::ios::binary | std::ios::in | std::ios::out);
+    int userIndex = 0;
+    while (masterFile.peek() != EOF) {
+        User user;
+        masterFile.read(reinterpret_cast<char*>(&user), sizeof(User));
+        if (user.firstReviewIndex != -1) {
+            if (mappingMap.find(user.firstReviewIndex) != mappingMap.end())
+                user.firstReviewIndex = mappingMap[user.firstReviewIndex];
+            else
+                user.firstReviewIndex = -1;
+        }
+        masterFile.seekp(userIndex * sizeof(User));
+        masterFile.write(reinterpret_cast<char*>(&user), sizeof(User));
+        userIndex++;
+    }
+    masterFile.close();
+}
+
+// Загальна функція для реорганізації обох файлів
+void reorganizeFiles() {
+    reorganizeMaster();
+    reorganizeSlave();
+    userTrash.clear();
+    reviewTrash.clear();
+    std::cout << "Files reorganized successfully." << std::endl;
 }
 
 int main() {
@@ -468,7 +639,7 @@ int main() {
     int id;
 
     while (true) {
-        std::cout << "\nEnter command (get-m, get-s, del-m, del-s, insert-m, insert-s, update-m, update-s, calc-m, calc-s, ut-m, ut-s, exit): ";
+        std::cout << "\nEnter command (get-m, get-s, del-m, del-s, insert-m, insert-s, update-m, update-s, calc-m, calc-s, ut-m, ut-s, reorg, exit): ";
         std::cin >> command;
         if (command == "get-m") {
             std::cin >> id;
@@ -498,12 +669,13 @@ int main() {
             utMaster();
         } else if (command == "ut-s") {
             utSlave();
+        } else if (command == "reorg") {
+            reorganizeFiles();
         } else if (command == "exit") {
             break;
         } else {
             std::cout << "Unknown command!" << std::endl;
         }
     }
-
     return 0;
 }
