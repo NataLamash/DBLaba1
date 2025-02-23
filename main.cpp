@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstring>
 #include <unordered_map>
+#include <string>
+#include <cstdio> // для remove та rename
 
 struct User {
     int userID;
@@ -30,7 +32,13 @@ struct UserIndex {
 std::vector<int> userTrash;   // Сміттєва зона для видалених записів користувачів
 std::vector<int> reviewTrash; // Сміттєва зона для видалених записів відгуків
 
-// Функції створення початкових файлів
+// Функція перевірки існування файлу
+bool fileExists(const std::string &filename) {
+    std::ifstream file(filename, std::ios::binary);
+    return file.good();
+}
+
+// Функції створення початкових файлів (будуть викликані лише при першому запуску)
 void createMaster() {
     std::ofstream masterFile("users.fl", std::ios::binary | std::ios::trunc);
     std::ofstream indexFile("users.ind", std::ios::binary | std::ios::trunc);
@@ -534,19 +542,29 @@ void utSlave() {
 
 // Функції для фізичної реорганізації файлів
 
-// Перебудова майстер-файлу та індексної таблиці
-void reorganizeMaster() {
+// Функція реорганізації майстер-файлу із перенумерацією UserID (починаючи з 1)
+// Повертає мапу, що зіставляє старі UserID з новими
+std::unordered_map<int,int> reorganizeMaster() {
     std::ifstream masterIn("users.fl", std::ios::binary);
     std::vector<User> newUsers;
     std::vector<UserIndex> newIndex;
     User user;
+    std::unordered_map<int,int> userIdMapping; // старий -> новий UserID
+
     while (masterIn.read(reinterpret_cast<char*>(&user), sizeof(User))) {
         if (!user.isDeleted) {
-            newIndex.push_back({user.userID, static_cast<int>(newUsers.size())});
             newUsers.push_back(user);
         }
     }
     masterIn.close();
+
+    // Присвоюємо нові UserID, починаючи з 1, та формуємо індексну таблицю
+    for (size_t i = 0; i < newUsers.size(); i++) {
+        int newId = static_cast<int>(i + 1);
+        userIdMapping[newUsers[i].userID] = newId;  // зберігаємо відповідність: старий -> новий
+        newUsers[i].userID = newId;
+        newIndex.push_back({newId, static_cast<int>(i)});
+    }
 
     std::ofstream masterOut("users_new.fl", std::ios::binary | std::ios::trunc);
     for (const auto &u : newUsers) {
@@ -556,7 +574,7 @@ void reorganizeMaster() {
     remove("users.fl");
     rename("users_new.fl", "users.fl");
 
-    // Сортуруємо індексну таблицю за userID
+    // Оновлюємо індексну таблицю (вже відсортована за новим UserID)
     std::sort(newIndex.begin(), newIndex.end(), [](const UserIndex &a, const UserIndex &b) {
         return a.userID < b.userID;
     });
@@ -565,31 +583,42 @@ void reorganizeMaster() {
         indexOut.write(reinterpret_cast<const char*>(&idx), sizeof(UserIndex));
     }
     indexOut.close();
+
+    return userIdMapping;
 }
 
-// Перебудова слейв файлу із корекцією зв’язків
-void reorganizeSlave() {
+// Функція реорганізації слейв файлу із перенумерацією ReviewID (починаючи з 1)
+// А також оновлює поле userID відгуків згідно з новими значеннями
+void reorganizeSlave(const std::unordered_map<int,int>& userIdMapping) {
     std::ifstream slaveIn("reviews.fl", std::ios::binary);
     std::vector<Review> newReviews;
-    // Карта: старий індекс -> новий індекс
-    std::unordered_map<int, int> mappingMap;
+    // Мапа: старий індекс -> новий індекс
+    std::unordered_map<int, int> reviewMapping;
     int oldIndex = 0;
     Review review;
     while (slaveIn.read(reinterpret_cast<char*>(&review), sizeof(Review))) {
         if (!review.isDeleted) {
+            int newReviewId = static_cast<int>(newReviews.size() + 1);
+            review.reviewID = newReviewId;
+            // Оновлюємо поле userID згідно з новим UserID
+            auto it = userIdMapping.find(review.userID);
+            if (it != userIdMapping.end())
+                review.userID = it->second;
+            else
+                review.userID = 0;
             int newIndex = newReviews.size();
             newReviews.push_back(review);
-            mappingMap[oldIndex] = newIndex;
+            reviewMapping[oldIndex] = newIndex;
         }
         oldIndex++;
     }
     slaveIn.close();
 
-    // Оновлюємо посилання у нових записах
+    // Оновлюємо посилання (nextReviewIndex) у нових записах
     for (auto &r : newReviews) {
         if (r.nextReviewIndex != -1) {
-            if (mappingMap.find(r.nextReviewIndex) != mappingMap.end())
-                r.nextReviewIndex = mappingMap[r.nextReviewIndex];
+            if (reviewMapping.find(r.nextReviewIndex) != reviewMapping.end())
+                r.nextReviewIndex = reviewMapping[r.nextReviewIndex];
             else
                 r.nextReviewIndex = -1;
         }
@@ -610,8 +639,8 @@ void reorganizeSlave() {
         User user;
         masterFile.read(reinterpret_cast<char*>(&user), sizeof(User));
         if (user.firstReviewIndex != -1) {
-            if (mappingMap.find(user.firstReviewIndex) != mappingMap.end())
-                user.firstReviewIndex = mappingMap[user.firstReviewIndex];
+            if (reviewMapping.find(user.firstReviewIndex) != reviewMapping.end())
+                user.firstReviewIndex = reviewMapping[user.firstReviewIndex];
             else
                 user.firstReviewIndex = -1;
         }
@@ -624,16 +653,21 @@ void reorganizeSlave() {
 
 // Загальна функція для реорганізації обох файлів
 void reorganizeFiles() {
-    reorganizeMaster();
-    reorganizeSlave();
+    // Спочатку перебудовуємо майстер-файл і отримуємо відповідність старих і нових UserID
+    std::unordered_map<int,int> userIdMapping = reorganizeMaster();
+    // Потім перебудовуємо слейв файл із оновленням ReviewID та userID
+    reorganizeSlave(userIdMapping);
     userTrash.clear();
     reviewTrash.clear();
     std::cout << "Files reorganized successfully." << std::endl;
 }
 
 int main() {
-    createMaster();
-    createSlave();
+    // Ініціалізація файлів виконується лише якщо вони відсутні
+    if (!fileExists("users.fl") || !fileExists("users.ind"))
+        createMaster();
+    if (!fileExists("reviews.fl"))
+        createSlave();
 
     std::string command;
     int id;
